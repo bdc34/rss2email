@@ -41,6 +41,9 @@ import urllib.error as _urllib_error
 import urllib.parse as _urllib_parse
 import urllib.request as _urllib_request
 import xml.sax as _sax
+from bs4 import BeautifulSoup
+import mimetypes as _mimetypes
+from email.mime.image import MIMEImage
 
 import feedparser as _feedparser
 import html2text as _html2text
@@ -441,7 +444,7 @@ class Feed (object):
         if len(parts) == 1:
             message = parts[0]
         else:
-            _MIMEMultipart()
+            message = _MIMEMultipart()
             for part in parts:
                 message.attach(part)
         _email.set_headers(
@@ -794,7 +797,18 @@ class Feed (object):
 
         Returns a the new HTML and a list of parts (which may be empty).
         """
-        return (html, [])  # TODO
+        if self.include_references:
+            parts = []
+            soup = BeautifulSoup( html )
+            for img in soup.find_all('img'):
+                _LOG.debug( "before: " + str(img) )
+                ref_link,part = self._get_reference( url=img['src'] )
+                parts.append( part )
+                img['src'] = ref_link
+                _LOG.debug( "after: " + str(img) )
+            return (str(soup),parts)
+        else:
+            return (html, []) 
 
     def _get_reference(self, url):
         """Get references for cid: links.
@@ -809,10 +823,25 @@ class Feed (object):
         """
         if self.include_references:
             cid = _email.get_id()
-            link = 'cid:{}'.format(_urllib_parse.quote(cid[1:-1]))
+            path = _urllib_parse.urlparse( url ).path
+            link = 'cid:{}{}'.format(_urllib_parse.quote( path ) ,
+                                     _urllib_parse.quote(cid[1:-1]) )            
             _LOG.critical(link)
-            part = _MIMENoneMultipart('image', 'png')
-            part.add_content(b'AAA')
+
+            ctype, encoding = _mimetypes.guess_type(path)
+
+            if ctype is None or encoding is not None:
+                # No guess could be made, or the file is encoded (compressed), so
+                # use a generic bag-of-bits type.
+                ctype = 'application/octet-stream'
+            maintype, subtype = ctype.split('/', 1)
+            if maintype == 'image':
+                resp = _urllib_request.urlopen( url )                
+                msg = MIMEImage(resp.read(), _subtype=subtype)
+                return (link,msg)
+            else:
+                _LOG.critical("could not deal with MIME type: "+ctype)
+                return (url,None)
         else:
             link = url
             part = None

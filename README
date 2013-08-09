@@ -42,6 +42,7 @@ things are in place.
 
   1. feedparser_
   2. html2text_
+  3. BeautifulSoup4_
 
 3. Figure out how you are going to send outgoing email.  You have two
    options here: either use an STMP server or a local sendmail
