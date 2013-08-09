@@ -28,19 +28,22 @@
 """
 
 import collections as _collections
-from email.mime.message import MIMEMessage as _MIMEMessage
 from email.mime.multipart import MIMEMultipart as _MIMEMultipart
+from email.mime.nonmultipart import MIMENonMultipart as _MIMENonMultipart
 from email.utils import formataddr as _formataddr
 import hashlib as _hashlib
+import html as _html
 import html.parser as _html_parser
 import re as _re
 import socket as _socket
 import time as _time
 import urllib.error as _urllib_error
+import urllib.parse as _urllib_parse
 import urllib.request as _urllib_request
-import uuid as _uuid
 import xml.sax as _sax
-import xml.sax.saxutils as _saxutils
+from bs4 import BeautifulSoup
+import mimetypes as _mimetypes
+from email.mime.image import MIMEImage
 
 import feedparser as _feedparser
 import html2text as _html2text
@@ -54,8 +57,7 @@ from . import error as _error
 from . import util as _util
 
 
-_USER_AGENT = 'rss2email/{} +{}'.format(__version__, __url__)
-_feedparser.USER_AGENT = _USER_AGENT
+_feedparser.USER_AGENT = 'rss2email/{} +{}'.format(__version__, __url__)
 _urllib_request.install_opener(_urllib_request.build_opener())
 _SOCKET_ERRORS = []
 for e in ['error', 'herror', 'gaierror']:
@@ -161,13 +163,13 @@ class Feed (object):
 
     # hints for value conversion
     _boolean_attributes = [
-        'digest',
         'force_from',
         'use_publisher_email',
         'friendly_name',
         'active',
         'date_header',
         'trust_guid',
+        'include_references',
         'html_mail',
         'use_css',
         'unicode_snob',
@@ -184,11 +186,6 @@ class Feed (object):
     _list_attributes = [
         'date_header_order',
         'encodings',
-        ]
-
-    _function_attributes = [
-        'post_process',
-        'digest_post_process',
         ]
 
     def __init__(self, name=None, url=None, to=None, config=None):
@@ -276,12 +273,8 @@ class Feed (object):
         self.__dict__.update(data)
 
     def _get_configured_option_value(self, attribute, value):
-        if value is None:
-            return ''
-        elif attribute in self._list_attributes:
+        if value and attribute in self._list_attributes:
             return ', '.join(value)
-        elif attribute in self._function_attributes:
-            return _util.import_name(value)
         return str(value)
 
     def _get_configured_attribute_value(self, attribute, key, data):
@@ -291,10 +284,6 @@ class Feed (object):
             return data.getint(key)
         elif attribute in self._list_attributes:
             return [x.strip() for x in data[key].split(',')]
-        elif attribute in self._function_attributes:
-            if data[key]:
-                return _util.import_function(data[key])
-            return None
         return data[key]
 
     def reset(self):
@@ -342,14 +331,7 @@ class Feed (object):
             _LOG.debug('processing {}'.format(entry.get('id', 'no-id')))
             processed = self._process_entry(parsed=parsed, entry=entry)
             if processed:
-                guid,id_,sender,message = processed
-                if self.post_process:
-                    message = self.post_process(
-                        feed=self, parsed=parsed, entry=entry, guid=guid,
-                        message=message)
-                    if not message:
-                        continue
-                yield (guid, id_, sender, message)
+                yield processed
 
     def _check_for_errors(self, parsed):
         warned = False
@@ -416,10 +398,6 @@ class Feed (object):
             not version):
             raise _error.ProcessingError(parsed=parsed, feed=feed)
 
-    def _html2text(self, html, baseurl=''):
-        self.config.setup_html2text(section=self.section)
-        return _html2text.html2text(html=html, baseurl=baseurl)
-
     def _process_entry(self, parsed, entry):
         id_ = self._get_entry_id(entry)
         # If .trust_guid isn't set, we get back hashes of the content.
@@ -436,8 +414,8 @@ class Feed (object):
         subject = self._get_entry_title(entry)
         extra_headers = _collections.OrderedDict((
                 ('Date', self._get_entry_date(entry)),
-                ('Message-ID', '<{}@dev.null.invalid>'.format(_uuid.uuid4())),
-                ('User-Agent', _USER_AGENT),
+                ('Message-ID', _email.get_id()),
+                ('User-Agent', 'rss2email'),
                 ('X-RSS-Feed', self.url),
                 ('X-RSS-ID', id_),
                 ('X-RSS-URL', self._get_entry_link(entry)),
@@ -458,17 +436,22 @@ class Feed (object):
 
         content = self._get_entry_content(entry)
         try:
-            content = self._process_entry_content(
+            parts = self._process_entry_content(
                 entry=entry, content=content, subject=subject)
         except _error.ProcessingError as e:
             e.parsed = parsed
             raise
-        message = _email.get_message(
+        if len(parts) == 1:
+            message = parts[0]
+        else:
+            message = _MIMEMultipart()
+            for part in parts:
+                message.attach(part)
+        _email.set_headers(
+            message=message,
             sender=sender,
             recipient=self.to,
             subject=subject,
-            body=content['value'],
-            content_type=content['type'].split('/', 1)[1],
             extra_headers=extra_headers,
             config=self.config,
             section=self.section)
@@ -501,12 +484,12 @@ class Feed (object):
         if hasattr(entry, 'title_detail') and entry.title_detail:
             title = entry.title_detail.value
             if 'html' in entry.title_detail.type:
-                title = self._html2text(title)
+                title = _html2text.html2text(title)
         else:
             content = self._get_entry_content(entry)
             value = content['value']
             if content['type'] in ('text/html', 'application/xhtml+xml'):
-                value = self._html2text(value)
+                value = _html2text.html2text(value)
             title = value[:70]
         title = title.replace('\n', ' ').strip()
         return title
@@ -692,8 +675,21 @@ class Feed (object):
         return {'type': 'text/plain', 'value': ''}
 
     def _process_entry_content(self, entry, content, subject):
-        "Convert entry content to the requested format."
+        """Convert entry content to the requested format
+
+        Returns a list of parts, with a `text/*` part first containing
+        the content.  If `self.include_references` is True, the
+        referenced parts are also included as attachments.
+        """
+        parts = []
         link = self._get_entry_link(entry)
+        if content['type'] in ('text/html', 'application/xhtml+xml'):
+            html_content,new_parts = self._process_entry_content_html(
+                entry=entry, content=content, subject=subject,
+                html=content['value'].strip())
+            parts.extend(new_parts)
+        else:
+            html_content = _html.escape(content['value'].strip())
         if self.html_mail:
             lines = [
                 '<!DOCTYPE html>',
@@ -709,7 +705,7 @@ class Feed (object):
             lines.extend([
                     '</head>',
                     '<body>',
-                    '<div id="entry">',
+                    '<div id="entry>',
                     '<h1 class="header"><a href="{}">{}</a></h1>'.format(
                         link, subject),
                     '<div id="body">',
@@ -717,29 +713,37 @@ class Feed (object):
             if content['type'] in ('text/html', 'application/xhtml+xml'):
                 lines.append(content['value'].strip())
             else:
-                lines.append(_saxutils.escape(content['value'].strip()))
+                lines.append(_html.escape(content['value'].strip()))
             lines.append('</div>')
             lines.extend([
                     '<div class="footer">'
                     '<p>URL: <a href="{0}">{0}</a></p>'.format(link),
                     ])
             for enclosure in getattr(entry, 'enclosures', []):
+                part = None
                 if getattr(enclosure, 'url', None):
+                    ref_link,part = self._get_reference(url=enclosure.url)
                     lines.append(
                         '<p>Enclosure: <a href="{0}">{0}</a></p>'.format(
-                            enclosure.url))
+                            ref_link))
                 if getattr(enclosure, 'src', None):
+                    ref_link,part = self._get_reference(url=enclosure.src)
                     lines.append(
                         '<p>Enclosure: <a href="{0}">{0}</a></p>'.format(
-                            enclosure.src))
-                    lines.append(
-                        '<p><img src="{}" /></p>'.format(enclosure.src))
+                            ref_link))
+                    lines.append('<p><img src="{}" /></p>'.format(ref_link))
+                if part:
+                    parts.append(part)
             for elink in getattr(entry, 'links', []):
+                part = None
                 if elink.get('rel', None) == 'via':
                     url = elink['href']
+                    ref_link,part = self._get_reference(url=url)
                     title = elink.get('title', url)
                     lines.append('<p>Via <a href="{}">{}</a></p>'.format(
-                            url, title))
+                            ref_link, title))
+                if part:
+                    parts.append(part)
             lines.extend([
                     '</div>',  # /footer
                     '</div>',  # /entry
@@ -748,11 +752,10 @@ class Feed (object):
                     ''])
             content['type'] = 'text/html'
             content['value'] = '\n'.join(lines)
-            return content
         else:  # not self.html_mail
             if content['type'] in ('text/html', 'application/xhtml+xml'):
                 try:
-                    lines = [self._html2text(content['value'])]
+                    lines = [_html2text.html2text(content['value'])]
                 except _html_parser.HTMLParseError as e:
                     raise _error.ProcessingError(parsed=None, feed=self)
             else:
@@ -760,18 +763,90 @@ class Feed (object):
             lines.append('')
             lines.append('URL: {}'.format(link))
             for enclosure in getattr(entry, 'enclosures', []):
-                if getattr(enclosure, 'url', None):
-                    lines.append('Enclosure: {}'.format(enclosure.url))
-                if getattr(enclosure, 'src', None):
-                    lines.append('Enclosure: {}'.format(enclosure.src))
+                for url in [
+                        getattr(enclosure, 'url', None),
+                        getattr(enclosure, 'src', None),
+                        ]:
+                    ref_link,part = self._get_reference(url=url)
+                    lines.append('Enclosure: {}'.format(ref_link))
+                    if part:
+                        parts.append(part)
             for elink in getattr(entry, 'links', []):
                 if elink.get('rel', None) == 'via':
                     url = elink['href']
+                    ref_link,part = self._get_reference(url=url)
                     title = elink.get('title', url)
-                    lines.append('Via: {} {}'.format(title, url))
+                    lines.append('Via: {} {}'.format(title, ref_link))
+                    if part:
+                        parts.append(part)
             content['type'] = 'text/plain'
             content['value'] = '\n'.join(lines)
-            return content
+        content_part = _email.get_mimetext(
+            body=content['value'],
+            content_type=content['type'].split('/', 1)[1],
+            config=self.config,
+            section=self.section)
+        parts.insert(0, content_part)
+        return parts
+
+    def _process_entry_content_html(self, entry, content, subject, html):
+        """Manipulate the entry HTML
+
+        For example, replace links to images with cid: links if
+        `self.include_references` is True.
+
+        Returns a the new HTML and a list of parts (which may be empty).
+        """
+        if self.include_references:
+            parts = []
+            soup = BeautifulSoup( html )
+            for img in soup.find_all('img'):
+                _LOG.debug( "before: " + str(img) )
+                ref_link,part = self._get_reference( url=img['src'] )
+                parts.append( part )
+                img['src'] = ref_link
+                _LOG.debug( "after: " + str(img) )
+            return (str(soup),parts)
+        else:
+            return (html, []) 
+
+    def _get_reference(self, url):
+        """Get references for cid: links.
+
+        RFC 2392 [1] provides linking between message parts based on
+        Content-IDs via `cid:...` URLs.  If `self.include_references`
+        is True, download the object referenced by `url` and return a
+        tuple containing a `cid:...` URL and the MIME part containing
+        the referenced data.  Otherwise, return `(url, None)`.
+
+        [1]: http://tools.ietf.org/html/rfc2392
+        """
+        if self.include_references:
+            cid = _email.get_id()
+            path = _urllib_parse.urlparse( url ).path
+            link = 'cid:{}{}'.format(_urllib_parse.quote( path ) ,
+                                     _urllib_parse.quote(cid[1:-1]) )            
+            _LOG.critical(link)
+
+            ctype, encoding = _mimetypes.guess_type(path)
+
+            if ctype is None or encoding is not None:
+                # No guess could be made, or the file is encoded (compressed), so
+                # use a generic bag-of-bits type.
+                ctype = 'application/octet-stream'
+            maintype, subtype = ctype.split('/', 1)
+            if maintype == 'image':
+                resp = _urllib_request.urlopen( url )                
+                msg = MIMEImage(resp.read(), _subtype=subtype)
+                return (link,msg)
+            else:
+                _LOG.critical("could not deal with MIME type: "+ctype)
+                return (url,None)
+        else:
+            link = url
+            part = None
+        _LOG.critical((link, part))
+        return (link, part)
 
     def _send(self, sender, message):
         _LOG.info('send message for {}'.format(self))
@@ -797,65 +872,12 @@ class Feed (object):
         if not self.to:
             raise _error.NoToEmailAddress(feed=self)
         parsed = self._fetch()
-
-        if self.digest:
-            digest = self._new_digest()
-            seen = []
-
         for (guid, id_, sender, message) in self._process(parsed):
             _LOG.debug('new message: {}'.format(message['Subject']))
-            if self.digest:
-                seen.append((guid, id_))
-                self._append_to_digest(digest=digest, message=message)
-            else:
-                if send:
-                    self._send(sender=sender, message=message)
-                if guid not in self.seen:
-                    self.seen[guid] = {}
-                self.seen[guid]['id'] = id_
-
-        if self.digest and seen:
-            if self.digest_post_process:
-                digest = self.digest_post_process(
-                    feed=self, parsed=parsed, seen=seen, message=digest)
-                if not digest:
-                    return
-            self._send_digest(
-                digest=digest, seen=seen, sender=sender, send=send)
-
-        self.etag = parsed.get('etag', None)
-        self.modified = parsed.get('modified', None)
-
-    def _new_digest(self):
-        digest = _MIMEMultipart('digest')
-        digest['To'] = self.to  # TODO: _Header(), _formataddr((recipient_name, recipient_addr))
-        digest['Subject'] = 'digest for {}'.format(self.name)
-        digest['Message-ID'] = '<{}@dev.null.invalid>'.format(_uuid.uuid4())
-        digest['User-Agent'] = _USER_AGENT
-        digest['X-RSS-Feed'] = self.url
-        return digest
-
-    def _append_to_digest(self, digest, message):
-        part = _MIMEMessage(message)
-        part.add_header('Content-Disposition', 'attachment')
-        digest.attach(part)
-
-    def _send_digest(self, digest, seen, sender, send=True):
-        """Send a digest message
-
-        The date is extracted from the last message in the digest
-        payload.  We assume that this part exists.  If you don't have
-        any messages in the digest, don't call this function.
-        """
-        digest['From'] = sender  # TODO: _Header(), _formataddr()...
-        last_part = digest.get_payload()[-1]
-        last_message = last_part.get_payload()[0]
-        digest['Date'] = last_message['Date']
-
-        _LOG.debug('new digest for {}'.format(self))
-        if send:
-            self._send(sender=sender, message=digest)
-        for (guid, id_) in seen:
+            if send:
+                self._send(sender=sender, message=message)
             if guid not in self.seen:
                 self.seen[guid] = {}
             self.seen[guid]['id'] = id_
+        self.etag = parsed.get('etag', None)
+        self.modified = parsed.get('modified', None)
