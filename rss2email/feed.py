@@ -42,6 +42,7 @@ import urllib.parse as _urllib_parse
 import urllib.request as _urllib_request
 import xml.sax as _sax
 from bs4 import BeautifulSoup
+import sys
 import mimetypes as _mimetypes
 from email.mime.image import MIMEImage
 
@@ -446,7 +447,8 @@ class Feed (object):
         else:
             message = _MIMEMultipart()
             for part in parts:
-                message.attach(part)
+                if part != None: 
+                    message.attach(part)
         _email.set_headers(
             message=message,
             sender=sender,
@@ -821,32 +823,39 @@ class Feed (object):
 
         [1]: http://tools.ietf.org/html/rfc2392
         """
-        if self.include_references:
-            cid = _email.get_id()
-            path = _urllib_parse.urlparse( url ).path
-            link = 'cid:{}{}'.format(_urllib_parse.quote( path ) ,
-                                     _urllib_parse.quote(cid[1:-1]) )            
-            _LOG.critical(link)
+        if not self.include_references:
+            return (url,None)
 
-            ctype, encoding = _mimetypes.guess_type(path)
-
-            if ctype is None or encoding is not None:
-                # No guess could be made, or the file is encoded (compressed), so
-                # use a generic bag-of-bits type.
-                ctype = 'application/octet-stream'
-            maintype, subtype = ctype.split('/', 1)
-            if maintype == 'image':
-                resp = _urllib_request.urlopen( url )                
-                msg = MIMEImage(resp.read(), _subtype=subtype)
-                return (link,msg)
-            else:
-                _LOG.critical("could not deal with MIME type: "+ctype)
-                return (url,None)
-        else:
+        cid = _email.get_id()
+        path = _urllib_parse.urlparse( url ).path
+        link = 'cid:{}{}'.format(_urllib_parse.quote( path ) ,
+                                 _urllib_parse.quote(cid[1:-1]) )
+        part = None
+        ctype, encoding = _mimetypes.guess_type(path)
+        
+        if ctype is None or encoding is not None:
+            # No guess could be made, or the file is encoded (compressed), 
+            # could use a generic bag-of-bits type.
+            #ctype = 'application/octet-stream'
             link = url
             part = None
-        _LOG.critical((link, part))
-        return (link, part)
+        else:
+            maintype, subtype = ctype.split('/', 1)
+            if maintype == 'image':
+                try:
+                    resp = _urllib_request.urlopen( url )
+                    part = MIMEImage(resp.read(), _subtype=subtype)
+                except:
+                    _LOG.critical("error while trying to get URL {0}as attachement:{1} "
+                                  .format(url, sys.exc_info()[0]))
+                    link = url
+                    part = None
+            else:
+                _LOG.critical("could not deal with MIME type: "+ctype)
+                link = url
+                part = None
+
+        return(link,part)
 
     def _send(self, sender, message):
         _LOG.info('send message for {}'.format(self))
