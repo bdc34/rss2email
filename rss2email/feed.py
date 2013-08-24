@@ -43,6 +43,7 @@ import urllib.request as _urllib_request
 import xml.sax as _sax
 from bs4 import BeautifulSoup
 import sys
+import os
 import mimetypes as _mimetypes
 from email.mime.image import MIMEImage
 
@@ -712,10 +713,7 @@ class Feed (object):
                         link, subject),
                     '<div id="body">',
                     ])
-            if content['type'] in ('text/html', 'application/xhtml+xml'):
-                lines.append(content['value'].strip())
-            else:
-                lines.append(_html.escape(content['value'].strip()))
+            lines.append(html_content.strip())            
             lines.append('</div>')
             lines.extend([
                     '<div class="footer">'
@@ -724,7 +722,7 @@ class Feed (object):
             for enclosure in getattr(entry, 'enclosures', []):
                 part = None
                 if getattr(enclosure, 'url', None):
-                    ref_link,part = self._get_reference(url=enclosure.url)
+                    ref_link,part  = self._get_reference(url=enclosure.url)
                     lines.append(
                         '<p>Enclosure: <a href="{0}">{0}</a></p>'.format(
                             ref_link))
@@ -735,7 +733,7 @@ class Feed (object):
                             ref_link))
                     lines.append('<p><img src="{}" /></p>'.format(ref_link))
                 if part:
-                    parts.append(part)
+                    parts.append( part )
             for elink in getattr(entry, 'links', []):
                 part = None
                 if elink.get('rel', None) == 'via':
@@ -745,7 +743,7 @@ class Feed (object):
                     lines.append('<p>Via <a href="{}">{}</a></p>'.format(
                             ref_link, title))
                 if part:
-                    parts.append(part)
+                    parts.append( part )
             lines.extend([
                     '</div>',  # /footer
                     '</div>',  # /entry
@@ -772,15 +770,15 @@ class Feed (object):
                     ref_link,part = self._get_reference(url=url)
                     lines.append('Enclosure: {}'.format(ref_link))
                     if part:
-                        parts.append(part)
+                        parts.append( part )
             for elink in getattr(entry, 'links', []):
                 if elink.get('rel', None) == 'via':
                     url = elink['href']
-                    ref_link,part = self._get_reference(url=url)
+                    ref_link,part  = self._get_reference(url=url)
                     title = elink.get('title', url)
                     lines.append('Via: {} {}'.format(title, ref_link))
                     if part:
-                        parts.append(part)
+                        parts.append( part )
             content['type'] = 'text/plain'
             content['value'] = '\n'.join(lines)
         content_part = _email.get_mimetext(
@@ -801,13 +799,15 @@ class Feed (object):
         """
         if self.include_references:
             parts = []
+            _LOG.debug( "before: " + str(html) )
+
             soup = BeautifulSoup( html )
             for img in soup.find_all('img'):
-                _LOG.debug( "before: " + str(img) )
-                ref_link,part = self._get_reference( url=img['src'] )
+                ref_link,part = self._get_reference( img['src'] )
                 parts.append( part )
                 img['src'] = ref_link
-                _LOG.debug( "after: " + str(img) )
+
+            _LOG.debug( "after: " + str(soup) )
             return (str(soup),parts)
         else:
             return (html, []) 
@@ -824,29 +824,38 @@ class Feed (object):
         [1]: http://tools.ietf.org/html/rfc2392
         """
         if not self.include_references:
-            return (url,None)
-
-        cid = _email.get_id()
-        path = _urllib_parse.urlparse( url ).path
-        link = 'cid:{}{}'.format(_urllib_parse.quote( path ) ,
-                                 _urllib_parse.quote(cid[1:-1]) )
+            return (url,None,{})
+        
         part = None
+        link = url
+
+        path = _urllib_parse.urlparse( url ).path
         ctype, encoding = _mimetypes.guess_type(path)
         
         if ctype is None or encoding is not None:
             # No guess could be made, or the file is encoded (compressed), 
             # could use a generic bag-of-bits type.
             #ctype = 'application/octet-stream'
+            _LOG.debug("No content type guess could be made, or the file is encoded (compressed)")
+            _LOG.debug("ctype:{} encoding:{}".format( ctype, encoding ))
             link = url
             part = None
+
         else:
+            cid,name =  self._make_content_id( url )
             maintype, subtype = ctype.split('/', 1)
             if maintype == 'image':
                 try:
-                    resp = _urllib_request.urlopen( url )
-                    part = MIMEImage(resp.read(), _subtype=subtype)
+                    resp = _urllib_request.urlopen( url )                 
+                    part = MIMEImage(resp.read(), _subtype=subtype )
+                    part.add_header('Content-Type', ctype, name=name)
+                    part.add_header('Content-Description', name )
+                    part.add_header('Content-Disposition', 'inline', filename=name )
+                    part.add_header('Content-ID', "<{}>".format(cid) )
+                    link = "cid:{}".format(cid)
+                    
                 except:
-                    _LOG.critical("error while trying to get URL {0}as attachement:{1} "
+                    _LOG.critical("Error while trying to get URL {0} as attachement:{1} "
                                   .format(url, sys.exc_info()[0]))
                     link = url
                     part = None
@@ -856,6 +865,25 @@ class Feed (object):
                 part = None
 
         return(link,part)
+
+    def _make_content_id(self, url ):
+        """ Try to do the cid as filename@someRandomNumber so android
+        gmail will display the attachements.
+        see: http://code.google.com/p/android/issues/detail?id=1180#c166
+
+        Returns (cid,filename)
+        """
+        # get just the file name part of the URL
+        path = _urllib_parse.urlparse( url ).path
+        filename = path.split('/')[-1]
+
+        # get emailid before @ and get rid of <> 
+        _LOG.debug("email for content: {}".format(_email.get_id()))
+        emailid = _email.get_id().split('@')[0].replace('<','')
+        out='{}@{}'.format(_urllib_parse.quote( filename ) ,
+                              _urllib_parse.quote( emailid ))
+        return(out,filename)
+
 
     def _send(self, sender, message):
         _LOG.info('send message for {}'.format(self))
