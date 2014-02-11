@@ -1,6 +1,7 @@
 # -*- encoding: utf-8 -*-
 #
-# Copyright (C) 2012-2013 Dmitry Bogatov <KAction@gnu.org>
+# Copyright (C) 2012-2013 Arun Persaud <apersaud@lbl.gov>
+#                         Dmitry Bogatov <KAction@gnu.org>
 #                         George Saunders <georgesaunders@gmail.com>
 #                         W. Trevor King <wking@tremily.us>
 #
@@ -190,7 +191,7 @@ def imap_send(message, config=None, section='DEFAULT'):
                 raise
             except Exception as e:
                 raise _error.IMAPAuthenticationError(
-                    server=server, username=username)
+                    server=server, port=port, username=username)
         mailbox = config.get(section, 'imap-mailbox')
         date = _imaplib.Time2Internaldate(_time.localtime())
         message_bytes = _flatten(message)

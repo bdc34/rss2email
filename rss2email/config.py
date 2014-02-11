@@ -72,9 +72,11 @@ CONFIG['DEFAULT'] = _collections.OrderedDict((
         # True: Use the publisher's email if you can't find the author's.
         # False: Just use the 'from' email instead.
         ('use-publisher-email', str(False)),
-        # Only use the feed email address rather than friendly name
-        # plus email address
-        ('friendly-name', str(True)),
+        # If empty, only use the feed email address rather than
+        # friendly name plus email address.  Available attributes may
+        # include 'feed', 'feed-title', 'author', and 'publisher', but
+        # only 'feed' is guaranteed.
+        ('name-format', '{feed-title}: {author}'),
         # Set this to default To email addresses.
         ('to', ''),
 
@@ -105,6 +107,12 @@ CONFIG['DEFAULT'] = _collections.OrderedDict((
         # True: Receive one email per post.
         # False: Receive an email every time a post changes.
         ('trust-guid', str(True)),
+        # True: Receive one email per unique link url.
+        # False: Defer to trust-guid preference.
+        # Toggling this for existing feeds may result in duplicates,
+        # because the old entries will not be recorded under their new
+        # link-based ids.
+        ('trust-link', str(False)),
         # To most correctly encode emails with international
         # characters, we iterate through the list below and use the
         # first character set that works.

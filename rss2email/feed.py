@@ -1,8 +1,11 @@
+# -*- coding: utf-8 -*-
 # Copyright (C) 2004-2013 Aaron Swartz
 #                         Brian Lalor
 #                         Dean Jackson
+#                         Dennis Keitzel <github@pinshot.net>
 #                         Erik Hetzner
 #                         Etienne Millon <me@emillon.org>
+#                         J. Lewis Muir <jlmuir@imca-cat.org>
 #                         Joey Hess
 #                         Lindsey Smith <lindsey.smith@gmail.com>
 #                         Marcel Ackermann
@@ -64,6 +67,10 @@ for e in ['error', 'herror', 'gaierror']:
 del e  # cleanup namespace
 _SOCKET_ERRORS = tuple(_SOCKET_ERRORS)
 
+# drv_libxml2 raises:
+#   TypeError: 'str' does not support the buffer interface
+_feedparser.PREFERRED_XML_PARSERS = []
+
 
 class Feed (object):
     """Utility class for feed manipulation and storage.
@@ -104,13 +111,18 @@ class Feed (object):
     >>> feed.url
     'http://example.com/feed.atom'
 
-    Names can only contain ASCII letters, digits, and '._-'.  Here the
+    Names can only contain letters, digits, and '._-'.  Here the
     invalid space causes an exception:
 
     >>> Feed(name='invalid name')
     Traceback (most recent call last):
       ...
     rss2email.error.InvalidFeedName: invalid feed name 'invalid name'
+
+    However, you aren't restricted to ASCII letters:
+
+    >>> Feed(name='Αθήνα')
+    <Feed Αθήνα (None -> )>
 
     You must define a URL:
 
@@ -124,8 +136,9 @@ class Feed (object):
 
     >>> CONFIG['DEFAULT']['to'] = ''
     >>> test_section = CONFIG.pop('feed.test-feed')
+
     """
-    _name_regexp = _re.compile('^[a-zA-Z0-9._-]+$')
+    _name_regexp = _re.compile('^[\w\d.-]+$')
 
     # saved/loaded from feed.dat using __getstate__/__setstate__.
     _dynamic_attributes = [
@@ -164,10 +177,10 @@ class Feed (object):
         'digest',
         'force_from',
         'use_publisher_email',
-        'friendly_name',
         'active',
         'date_header',
         'trust_guid',
+        'trust_link',
         'html_mail',
         'use_css',
         'unicode_snob',
@@ -404,6 +417,11 @@ class Feed (object):
         elif isinstance(exc, _sax.SAXParseException):
             _LOG.error('sax parsing error: {}: {}'.format(exc, self))
             warned = True
+        elif (parsed.bozo and
+              isinstance(exc, _feedparser.CharacterEncodingOverride)):
+            _LOG.warning(
+                'incorrectly declared encoding: {}: {}'.format(exc, self))
+            warned = True
         elif parsed.bozo or exc:
             if exc is None:
                 exc = "can't process"
@@ -416,9 +434,14 @@ class Feed (object):
             not version):
             raise _error.ProcessingError(parsed=parsed, feed=feed)
 
-    def _html2text(self, html, baseurl=''):
+    def _html2text(self, html, baseurl='', default=None):
         self.config.setup_html2text(section=self.section)
-        return _html2text.html2text(html=html, baseurl=baseurl)
+        try:
+            return _html2text.html2text(html=html, baseurl=baseurl)
+        except _html_parser.HTMLParseError as e:
+            if default is not None:
+                return default
+            raise
 
     def _process_entry(self, parsed, entry):
         id_ = self._get_entry_id(entry)
@@ -476,6 +499,8 @@ class Feed (object):
 
     def _get_entry_id(self, entry):
         """Get best ID from an entry."""
+        if self.trust_link:
+            return entry.get('link', None)
         if self.trust_guid:
             if getattr(entry, 'id', None):
                 # Newer versions of feedparser could return a dictionary
@@ -501,12 +526,12 @@ class Feed (object):
         if hasattr(entry, 'title_detail') and entry.title_detail:
             title = entry.title_detail.value
             if 'html' in entry.title_detail.type:
-                title = self._html2text(title)
+                title = self._html2text(title, default=title)
         else:
             content = self._get_entry_content(entry)
             value = content['value']
             if content['type'] in ('text/html', 'application/xhtml+xml'):
-                value = self._html2text(value)
+                value = self._html2text(value, default=value)
             title = value[:70]
         title = title.replace('\n', ' ').strip()
         return title
@@ -538,31 +563,38 @@ class Feed (object):
         ...     '</feed>\\n'
         ...     )
         >>> entry = parsed.entries[0]
-        >>> f.friendly_name = False
+        >>> f.name_format = ''
         >>> f._get_entry_name(parsed, entry)
         ''
-        >>> f.friendly_name = True
+        >>> f.name_format = '{author}'
         >>> f._get_entry_name(parsed, entry)
         'Example author'
+        >>> f.name_format = '{feed-title}: {author}'
+        >>> f._get_entry_name(parsed, entry)
+        ': Example author'
+        >>> f.name_format = '{author} ({feed.name})'
+        >>> f._get_entry_name(parsed, entry)
+        'Example author (test-feed)'
         """
-        if not self.friendly_name:
+        if not self.name_format:
             return ''
-        parts = ['']
+        data = {
+            'feed': self,
+            'feed-title': '<feed title>',
+            'author': '<author>',
+            'publisher': '<publisher>',
+            }
         feed = parsed.feed
-        parts.append(feed.get('title', ''))
+        data['feed-title'] = feed.get('title', '')
         for x in [entry, feed]:
             if 'name' in x.get('author_detail', []):
                 if x.author_detail.name:
-                    if ''.join(parts):
-                        parts.append(': ')
-                    parts.append(x.author_detail.name)
+                    data['author'] = x.author_detail.name
                     break
-        if not ''.join(parts) and self.use_publisher_email:
-            if 'name' in feed.get('publisher_detail', []):
-                if ''.join(parts):
-                    parts.append(': ')
-                parts.append(feed.publisher_detail.name)
-        return _html2text.unescape(''.join(parts))
+        if 'name' in feed.get('publisher_detail', []):
+            data['publisher'] = feed.publisher_detail.name
+        name = self.name_format.format(**data)
+        return _html2text.unescape(name)
 
     def _validate_email(self, email, default=None):
         """Do a basic quality check on email address
